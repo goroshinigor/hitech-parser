@@ -36,7 +36,7 @@ from .search_flow import (
     DEFAULT_TIMEOUT,
     HOME_URL,
     LOCALE,
-    PRODUCT_TITLE,
+    PRODUCT_READY,
     RESULT_ITEMS,
     RESULT_TITLE_LINK,
     RESULTS_WAIT,
@@ -101,17 +101,22 @@ class PlaywrightSearchParser:
         self._browser = self._playwright.chromium.launch(
             headless=self.headless, args=list(STEALTH_ARGS)
         )
-        self._context = self._browser.new_context(
+        self._context = self._new_context()
+        self._page = self._context.new_page()
+        return self._page
+
+    def _new_context(self):
+        """Новый контекст браузера: своя «сессия» (cookie, кэш) и своя страница."""
+        context = self._browser.new_context(
             locale=LOCALE,
             timezone_id=TIMEZONE,
             viewport={"width": WINDOW_WIDTH, "height": WINDOW_HEIGHT},
             user_agent=USER_AGENT,
         )
         # Убираем navigator.webdriver: без этого Cloudflare не пускает headless.
-        self._context.add_init_script(STEALTH_SCRIPT)
-        self._context.set_default_timeout(self.timeout_ms)
-        self._page = self._context.new_page()
-        return self._page
+        context.add_init_script(STEALTH_SCRIPT)
+        context.set_default_timeout(self.timeout_ms)
+        return context
 
     @property
     def page(self):
@@ -195,6 +200,35 @@ class PlaywrightSearchParser:
         except Exception:  # noqa: BLE001 - сброс cookie не критичен
             pass
 
+    def restart(self) -> None:
+        """Начинает новую сессию браузера (Шаг-4).
+
+        Cloudflare на этом сайте отдаёт челлендж на третью навигацию в сессии, а
+        первая навигация свежего контекста всегда проходит: в нём нет ни cookie,
+        ни следов предыдущих переходов. Чужую страницу (переданную в
+        конструктор) пересоздавать нельзя — тогда просто чистим cookie.
+        """
+        if not self._owns_page:
+            self._reset_session()
+            return
+        if self._browser is None:  # браузер ещё не запускали — перезапускать нечего
+            self._page = None
+            return
+        if self._context is not None:
+            self._context.close()
+        self._context = self._new_context()
+        self._page = self._context.new_page()
+
+    def _wait_card(self, timeout: Optional[int] = None) -> None:
+        """Ждёт, что открылась карточка товара, а не челлендж Cloudflare.
+
+        Признак — блок характеристик (``PRODUCT_READY``): на странице челленджа
+        его нет, хотя ``h1`` («Just a moment...») есть.
+        """
+        self.page.locator(PRODUCT_READY).first.wait_for(
+            state="attached", timeout=(timeout or self.timeout) * 1000
+        )
+
     def search(self, query: Optional[str] = None) -> str:
         """Шаг-2 и Шаг-3: вводит запрос и нажимает кнопку «Найти»."""
         query = query or self.query
@@ -229,9 +263,9 @@ class PlaywrightSearchParser:
     def open_first_result(self, wait: Optional[int] = None) -> str:
         """Шаг-4: кликает первый результат и возвращает URL карточки товара.
 
-        ``wait`` — сколько секунд ждать список результатов (по умолчанию
-        ``self.timeout``). Короткое ожидание на первой попытке нужно, чтобы
-        быстро перейти к страховке, если Cloudflare отдал челлендж.
+        ``wait`` — сколько секунд ждать список результатов и загрузку карточки
+        (по умолчанию ``self.timeout``). Короткое ожидание на первой попытке
+        нужно, чтобы быстро перейти к страховке, если Cloudflare отдал челлендж.
         """
         try:
             self.page.locator(RESULT_ITEMS).first.wait_for(
@@ -247,17 +281,20 @@ class PlaywrightSearchParser:
         url = link.get_attribute("href") or ""
         # Ссылка в карточке скрыта до наведения, поэтому клик «силой»; перед
         # переходом на карточку товара сбрасываем cookie (третья навигация).
-        self._reset_session()
         try:
-            link.click(force=True)
-            self.page.locator(PRODUCT_TITLE).first.wait_for(
-                state="visible", timeout=self.timeout_ms
-            )
-            return self.page.url or url
-        except Exception:  # noqa: BLE001 - клик не сработал, открываем по адресу
             self._reset_session()
-            self.page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            link.click(force=True)
+            self._wait_card(wait)
             return self.page.url or url
+        except Exception:  # noqa: BLE001 - челлендж или клик не сработал
+            pass
+
+        # Челлендж Cloudflare: открываем адрес карточки в свежей сессии — её
+        # первая навигация проходит без проверки.
+        self.restart()
+        self.page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+        self._wait_card()
+        return self.page.url or url
 
     # ------------------------------------------------------------------ #
     # Шаг-5 и Шаг-6

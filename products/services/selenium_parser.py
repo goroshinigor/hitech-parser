@@ -16,8 +16,9 @@
     python -m products.services.selenium_parser "Apple iPhone 15 128GB Black"
 
 Живьём нужен Chrome/Chromium: chromedriver Selenium подбирает сам
-(Selenium Manager). Если браузер лежит в нестандартном месте, путь можно
-передать в ``browser_binary`` (у CLI — ``--chrome-binary``).
+(Selenium Manager), а сам браузер ищется в стандартных местах и в кэше
+Playwright (:func:`find_browser_binary`). Если браузер лежит в нестандартном
+месте, путь можно передать в ``browser_binary`` (у CLI — ``--chrome-binary``).
 
 Библиотека ``selenium`` импортируется лениво (внутри методов), поэтому модуль
 импортируется даже там, где браузерные библиотеки не установлены.
@@ -25,7 +26,9 @@
 
 from __future__ import annotations
 
+import glob
 import json
+import os
 import sys
 from types import TracebackType
 from typing import List, Optional, Type
@@ -36,7 +39,7 @@ from .search_flow import (
     DEFAULT_TIMEOUT,
     HOME_URL,
     LOCALE,
-    PRODUCT_TITLE,
+    PRODUCT_READY,
     RESULT_ITEMS,
     RESULT_TITLE_LINK,
     RESULTS_WAIT,
@@ -60,6 +63,35 @@ def _css_selector() -> str:
     from selenium.webdriver.common.by import By
 
     return By.CSS_SELECTOR
+
+
+#: Где искать браузер, если ``--chrome-binary`` не передан: сначала системный
+#: Chrome/Chromium, затем Chromium, который ставит Playwright (он есть в
+#: Docker-образе с ``INSTALL_BROWSERS=1``).
+BROWSER_CANDIDATES = (
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+)
+
+#: Chromium из кэша Playwright (номер версии в пути меняется при обновлении).
+PLAYWRIGHT_BROWSER_GLOB = "~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome"
+
+
+def find_browser_binary() -> Optional[str]:
+    """Путь к Chrome/Chromium для Selenium.
+
+    ``None`` — браузер не нашли, и пусть решает Selenium Manager (он умеет
+    скачать подходящий Chrome сам, если есть сеть).
+    """
+    for candidate in BROWSER_CANDIDATES:
+        if os.path.exists(candidate):
+            return candidate
+    for candidate in sorted(glob.glob(os.path.expanduser(PLAYWRIGHT_BROWSER_GLOB))):
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 
 class SeleniumSearchParser:
@@ -104,8 +136,9 @@ class SeleniumSearchParser:
         options.add_argument(f"--lang={LOCALE}")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
-        if self.browser_binary:
-            options.binary_location = self.browser_binary
+        binary = self.browser_binary or find_browser_binary()
+        if binary:
+            options.binary_location = binary
 
         driver = webdriver.Chrome(options=options)
         driver.set_page_load_timeout(self.timeout)
@@ -157,11 +190,21 @@ class SeleniumSearchParser:
             conditions.element_to_be_clickable((_css_selector(), css)), timeout
         )
 
-    def _wait_present(self, css: str):
+    def _wait_present(self, css: str, timeout: Optional[int] = None):
         """Ждёт появления элемента в DOM (видимость не требуется)."""
         from selenium.webdriver.support import expected_conditions as conditions
 
-        return self._wait(conditions.presence_of_element_located((_css_selector(), css)))
+        return self._wait(
+            conditions.presence_of_element_located((_css_selector(), css)), timeout
+        )
+
+    def _wait_card(self, timeout: Optional[int] = None) -> None:
+        """Ждёт, что открылась карточка товара, а не челлендж Cloudflare.
+
+        Признак — блок характеристик (``PRODUCT_READY``): на странице челленджа
+        его нет, хотя ``h1`` («Just a moment...») есть.
+        """
+        self._wait_present(PRODUCT_READY, timeout)
 
     def _visible_search_input(self):
         """Первое видимое поле поиска (форм на странице две)."""
@@ -191,11 +234,37 @@ class SeleniumSearchParser:
         первой: браузер получает cookie, помечающую сессию, и следующий переход
         блокируется. Без cookie каждый переход снова выглядит «свежим» и
         проходит (проверено живым прогоном).
+
+        Важно: ``delete_all_cookies()`` не удаляет HttpOnly-cookie
+        ``cf_clearance``, поэтому пустая сессия с одним лишь ``cf_clearance``
+        всё равно попадает на челлендж (проверено живым прогоном). Cookie
+        чистим на уровне браузера через CDP, а ``delete_all_cookies``
+        оставляем резервом для браузеров без CDP.
         """
+        driver = self.driver
         try:
-            self.driver.delete_all_cookies()
+            driver.execute_cdp_cmd("Network.clearBrowserCookies", {})
+            return
+        except Exception:  # noqa: BLE001 - CDP недоступен, чистим через WebDriver
+            pass
+        try:
+            driver.delete_all_cookies()
         except Exception:  # noqa: BLE001 - сброс cookie не критичен
             pass
+
+    def restart(self) -> None:
+        """Начинает новую сессию браузера (Шаг-4).
+
+        Cloudflare на этом сайте отдаёт челлендж на третью навигацию в сессии, а
+        первая навигация свежего браузера всегда проходит: у него нет ни cookie,
+        ни следов предыдущих переходов. Чужой драйвер (переданный в конструктор)
+        перезапускать нельзя — тогда просто чистим cookie.
+        """
+        if not self._owns_driver:
+            self._reset_session()
+            return
+        self.close()
+        _ = self.driver  # создаёт браузер заново
 
     def open_home(self) -> str:
         """Шаг-1: открывает главную страницу и дожидается формы поиска."""
@@ -244,9 +313,9 @@ class SeleniumSearchParser:
     def open_first_result(self, wait: Optional[int] = None) -> str:
         """Шаг-4: кликает первый результат и возвращает URL карточки товара.
 
-        ``wait`` — сколько секунд ждать список результатов (по умолчанию
-        ``self.timeout``). Короткое ожидание на первой попытке нужно, чтобы
-        быстро перейти к страховке, если Cloudflare отдал челлендж.
+        ``wait`` — сколько секунд ждать список результатов и загрузку карточки
+        (по умолчанию ``self.timeout``). Короткое ожидание на первой попытке
+        нужно, чтобы быстро перейти к страховке, если Cloudflare отдал челлендж.
         """
         try:
             self._wait_css(RESULT_ITEMS, wait)
@@ -268,15 +337,20 @@ class SeleniumSearchParser:
         url = link.get_attribute("href") or ""
         # Ссылка в карточке скрыта до наведения, поэтому клик через JS; перед
         # переходом на карточку товара сбрасываем cookie (третья навигация).
-        self._reset_session()
         try:
-            self.driver.execute_script("arguments[0].click()", link)
-            self._wait_css(PRODUCT_TITLE)
-            return self.driver.current_url or url
-        except Exception:  # noqa: BLE001 - клик не сработал, открываем по адресу
             self._reset_session()
-            self.driver.get(url)
+            self.driver.execute_script("arguments[0].click()", link)
+            self._wait_card(wait)
             return self.driver.current_url or url
+        except Exception:  # noqa: BLE001 - челлендж или клик не сработал
+            pass
+
+        # Челлендж Cloudflare: открываем адрес карточки в свежей сессии — её
+        # первая навигация проходит без проверки.
+        self.restart()
+        self.driver.get(url)
+        self._wait_card()
+        return self.driver.current_url or url
 
     # ------------------------------------------------------------------ #
     # Шаг-5 и Шаг-6

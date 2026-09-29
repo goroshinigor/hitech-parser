@@ -30,6 +30,7 @@ from .services.playwright_parser import PlaywrightSearchParser
 from .services.search_flow import (
     DEFAULT_QUERY,
     HOME_URL,
+    PRODUCT_READY,
     PRODUCT_TITLE,
     RESULT_ITEMS,
     RESULT_TITLE_LINK,
@@ -39,7 +40,11 @@ from .services.search_flow import (
     search_url,
     validate_product,
 )
-from .services.selenium_parser import SeleniumSearchParser
+from .services.selenium_parser import (
+    PLAYWRIGHT_BROWSER_GLOB,
+    SeleniumSearchParser,
+    find_browser_binary,
+)
 
 try:  # selenium нужен только этим тестам и стоит в requirements.txt
     from selenium.common.exceptions import (
@@ -429,6 +434,7 @@ class FakeDriverMixin:
             SEARCH_INPUT: search_input,
             RESULT_ITEMS: result_item,
             PRODUCT_TITLE: element("product_title"),
+            PRODUCT_READY: element("product_ready"),
         }
         driver.find_element.side_effect = lambda by, selector: elements[selector]
         driver.find_elements.side_effect = lambda by, selector: {
@@ -473,11 +479,15 @@ class FakeDriverMixin:
         product_title = MagicMock(name="product_title")
         product_title.first = product_title
 
+        product_ready = MagicMock(name="product_ready")
+        product_ready.first = product_ready
+
         locators = {
             SEARCH_INPUT: fields,
             RESULT_ITEMS: items,
             f"{RESULT_ITEMS} {RESULT_TITLE_LINK}": result_link,
             PRODUCT_TITLE: product_title,
+            PRODUCT_READY: product_ready,
         }
         page.locator.side_effect = lambda selector: locators[selector]
         return page, {
@@ -485,8 +495,80 @@ class FakeDriverMixin:
             "submit": submit,
             "result_link": result_link,
             "items": items,
+            "product_ready": product_ready,
         }
 
+
+
+class BrowserBinaryTests(SimpleTestCase):
+    """Поиск браузера для Selenium: системный Chrome или Chromium от Playwright."""
+
+    def test_prefers_system_browser(self):
+        with (
+            patch(
+                "products.services.selenium_parser.os.path.exists",
+                side_effect=lambda path: path == "/usr/bin/chromium",
+            ),
+            patch(
+                "products.services.selenium_parser.glob.glob",
+                return_value=["/pw/chromium-1243/chrome-linux64/chrome"],
+            ),
+        ):
+            self.assertEqual(find_browser_binary(), "/usr/bin/chromium")
+
+    def test_falls_back_to_playwright_chromium(self):
+        chromium = "/pw/chromium-1243/chrome-linux64/chrome"
+        with (
+            patch(
+                "products.services.selenium_parser.os.path.exists",
+                side_effect=lambda path: path == chromium,
+            ),
+            patch(
+                "products.services.selenium_parser.glob.glob",
+                return_value=[chromium],
+            ) as glob_mock,
+        ):
+            self.assertEqual(find_browser_binary(), chromium)
+
+        self.assertEqual(
+            glob_mock.call_args.args,
+            (os.path.expanduser(PLAYWRIGHT_BROWSER_GLOB),),
+        )
+
+    def test_no_browser_found_returns_none(self):
+        with (
+            patch("products.services.selenium_parser.os.path.exists", return_value=False),
+            patch("products.services.selenium_parser.glob.glob", return_value=[]),
+        ):
+            self.assertIsNone(find_browser_binary())
+
+    def test_create_driver_uses_detected_browser(self):
+        with (
+            patch(
+                "products.services.selenium_parser.find_browser_binary",
+                return_value="/opt/browser/chrome",
+            ),
+            patch("selenium.webdriver.Chrome") as chrome,
+        ):
+            SeleniumSearchParser()._create_driver()
+
+        self.assertEqual(
+            chrome.call_args.kwargs["options"].binary_location, "/opt/browser/chrome"
+        )
+
+    def test_explicit_binary_wins_over_detected(self):
+        with (
+            patch(
+                "products.services.selenium_parser.find_browser_binary",
+                return_value="/opt/browser/chrome",
+            ),
+            patch("selenium.webdriver.Chrome") as chrome,
+        ):
+            SeleniumSearchParser(browser_binary="/usr/bin/chromium")._create_driver()
+
+        self.assertEqual(
+            chrome.call_args.kwargs["options"].binary_location, "/usr/bin/chromium"
+        )
 
 
 class SeleniumFlowTests(FakeDriverMixin, SimpleTestCase):
@@ -513,8 +595,14 @@ class SeleniumFlowTests(FakeDriverMixin, SimpleTestCase):
         )
         self.assertEqual(elements["result_link"].get_attribute.call_args.args, ("href",))
         # Cookie сброшены перед второй и третьей навигацией: иначе Cloudflare
-        # отдаёт челлендж вместо страницы.
-        self.assertEqual(driver.delete_all_cookies.call_count, 2)
+        # отдаёт челлендж вместо страницы. Чистим через CDP — только так
+        # удаляется HttpOnly-cookie cf_clearance.
+        self.assertEqual(driver.execute_cdp_cmd.call_count, 2)
+        self.assertEqual(
+            {call.args[0] for call in driver.execute_cdp_cmd.call_args_list},
+            {"Network.clearBrowserCookies"},
+        )
+        driver.delete_all_cookies.assert_not_called()
         # Шаг-5: данные собраны тем же bs4-парсером, что и в requests-версии.
         self.assertEqual(data, parse_product(PRODUCT_HTML, RESULT_URL))
         self.assertEqual(data["product_code"], "U0961530")
@@ -597,6 +685,89 @@ class SeleniumFlowTests(FakeDriverMixin, SimpleTestCase):
 
         self.assertEqual(url, RESULT_URL)
         self.assertEqual(driver.get.call_args.args, (RESULT_URL,))
+
+    def test_card_challenge_opens_url_in_fresh_session(self):
+        """Челлендж вместо карточки: адрес открывается в свежей сессии.
+
+        Блок характеристик (``PRODUCT_READY``) появиться не может — его нет на
+        странице челленджа, поэтому парсер переходит по адресу товара.
+        """
+        driver, elements = self.selenium_driver()
+        real_find = driver.find_element.side_effect
+        challenged = {"value": True}
+
+        def find(by, selector):
+            if selector == PRODUCT_READY and challenged["value"]:
+                raise NoSuchElementException("блока характеристик нет")
+            return real_find(by, selector)
+
+        driver.find_element.side_effect = find
+        # Прямой переход в свежей сессии открывает карточку: челленджа больше нет.
+        driver.get.side_effect = lambda url: challenged.update(value=False)
+        parser = SeleniumSearchParser(driver=driver, timeout=0)
+
+        url = parser.open_first_result()
+
+        self.assertEqual(url, RESULT_URL)
+        # Шаг-4 всё равно выполнен: сначала был клик по ссылке результата.
+        driver.execute_script.assert_called_once()
+        # Карточка открыта по адресу товара, чужой драйвер не перезапускается —
+        # только чистка cookie (перед кликом и перед прямым переходом).
+        self.assertEqual(driver.get.call_args.args, (RESULT_URL,))
+        driver.quit.assert_not_called()
+        self.assertEqual(driver.execute_cdp_cmd.call_count, 2)
+
+    def test_restart_recreates_browser_when_owned(self):
+        """Свой браузер перезапускается: свежая сессия проходит Cloudflare."""
+        driver, _ = self.selenium_driver()
+        parser = SeleniumSearchParser()
+
+        with patch.object(
+            SeleniumSearchParser, "_create_driver", return_value=driver
+        ) as create:
+            self.assertIs(parser.driver, driver)
+            parser.restart()
+
+        self.assertEqual(create.call_count, 2)
+        driver.quit.assert_called_once()
+
+    def test_restart_keeps_foreign_driver(self):
+        """Чужой драйвер (из тестов или CLI) перезапускать нельзя."""
+        driver, _ = self.selenium_driver()
+        parser = SeleniumSearchParser(driver=driver)
+
+        parser.restart()
+
+        driver.quit.assert_not_called()
+        driver.execute_cdp_cmd.assert_called_once_with("Network.clearBrowserCookies", {})
+
+    def test_reset_session_clears_cookies_via_cdp(self):
+        driver, _ = self.selenium_driver()
+        parser = SeleniumSearchParser(driver=driver)
+
+        parser._reset_session()
+
+        driver.execute_cdp_cmd.assert_called_once_with("Network.clearBrowserCookies", {})
+        driver.delete_all_cookies.assert_not_called()
+
+    def test_reset_session_falls_back_to_webdriver(self):
+        driver, _ = self.selenium_driver()
+        driver.execute_cdp_cmd.side_effect = WebDriverException("CDP недоступен")
+        parser = SeleniumSearchParser(driver=driver)
+
+        parser._reset_session()
+
+        driver.delete_all_cookies.assert_called_once_with()
+
+    def test_reset_session_swallows_webdriver_error(self):
+        driver, _ = self.selenium_driver()
+        driver.execute_cdp_cmd.side_effect = WebDriverException("CDP недоступен")
+        driver.delete_all_cookies.side_effect = WebDriverException("cookie недоступны")
+        parser = SeleniumSearchParser(driver=driver)
+
+        parser._reset_session()  # не должно бросить исключение
+
+        driver.delete_all_cookies.assert_called_once_with()
 
     def test_run_prints_product_and_keeps_foreign_driver_open(self):
         driver, _ = self.selenium_driver()
@@ -781,6 +952,65 @@ class PlaywrightFlowTests(FakeDriverMixin, SimpleTestCase):
 
         self.assertEqual(url, RESULT_URL)
         self.assertEqual(page.goto.call_args.args, (RESULT_URL,))
+
+    def test_card_challenge_opens_url_in_fresh_session(self):
+        """Челлендж вместо карточки: адрес открывается в свежей сессии.
+
+        Блок характеристик (``PRODUCT_READY``) появиться не может — его нет на
+        странице челленджа, поэтому парсер переходит по адресу товара.
+        """
+        page, locators = self.playwright_page()
+        locators["product_ready"].first.wait_for.side_effect = RuntimeError(
+            "Timeout 60000ms exceeded"
+        )
+        # Прямой переход в свежей сессии открывает карточку: челленджа больше нет.
+        page.goto.side_effect = lambda *args, **kwargs: (
+            setattr(locators["product_ready"].first.wait_for, "side_effect", None)
+        )
+        parser = PlaywrightSearchParser(page=page)
+
+        url = parser.open_first_result()
+
+        self.assertEqual(url, RESULT_URL)
+        # Шаг-4 всё равно выполнен: сначала был клик по ссылке результата.
+        locators["result_link"].click.assert_called_once()
+        # Карточка открыта по адресу товара, чужую страницу не пересоздаём —
+        # только чистка cookie (перед кликом и перед прямым переходом).
+        self.assertEqual(
+            page.goto.call_args.kwargs,
+            {"wait_until": "domcontentloaded", "timeout": 60000},
+        )
+        self.assertEqual(page.context.clear_cookies.call_count, 2)
+        page.close.assert_not_called()
+
+    def test_restart_creates_new_context_when_owned(self):
+        """Свой браузер получает свежий контекст: он проходит Cloudflare."""
+        parser = PlaywrightSearchParser()
+        old_context = MagicMock(name="old_context")
+        new_context = MagicMock(name="new_context")
+        new_page = MagicMock(name="new_page")
+        new_context.new_page.return_value = new_page
+        parser._browser = MagicMock(name="browser")
+        parser._context = old_context
+
+        with patch.object(
+            PlaywrightSearchParser, "_new_context", return_value=new_context
+        ):
+            parser.restart()
+
+        old_context.close.assert_called_once()
+        new_context.new_page.assert_called_once()
+        self.assertIs(parser.page, new_page)
+
+    def test_restart_keeps_foreign_page(self):
+        """Чужую страницу (из тестов) пересоздавать нельзя."""
+        page, _ = self.playwright_page()
+        parser = PlaywrightSearchParser(page=page)
+
+        parser.restart()
+
+        page.context.clear_cookies.assert_called_once_with()
+        page.close.assert_not_called()
 
 class FakeSearchParser:
     """Заглушка браузерного парсера для тестов команды ``parse_search``."""

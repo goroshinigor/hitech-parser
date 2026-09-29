@@ -46,6 +46,12 @@ RESULT_TITLE_LINK = ".br-pp-ipd-shown a[href]"
 #: Шаг-5. Признак того, что открылась именно карточка товара.
 PRODUCT_TITLE = "h1"
 
+#: Шаг-5. Признак того, что карточка догрузилась: блок характеристик (его же
+#: разбирает ``hi_parser.parse_product``). На странице челленджа Cloudflare этого
+#: блока нет, а ``h1`` есть — там заголовок «Just a moment...», поэтому ждать надо
+#: именно блок характеристик.
+PRODUCT_READY = ".br-pr-chr-wrap"
+
 #: Признаки челленджа Cloudflare: если они в разметке, страница не открылась.
 CHALLENGE_MARKERS = ("Just a moment", "cf_chl_opt")
 
