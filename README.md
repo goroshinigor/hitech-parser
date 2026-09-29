@@ -85,14 +85,25 @@ GET /api/parse/?url=<URL товара>
 Возвращает JSON `{"saved": true, "id": ..., "product": {...}}` и сохраняет
 товар в БД. Без параметра `url` парсится товар из задания.
 
+Веб-страница с кнопкой:
+
+```
+GET /api/hello/
+```
+
+Страница с предзаполненным URL товара и кнопкой **Parse**: по клику JS
+обращается к `/api/parse/`, сохраняет товар и выводит полученный JSON
+в блок на странице (ошибки парсинга показываются там же).
+
 ## Структура
 
 ```
 config/                     настройки Django
 api/
   models.py                 модель Product
-  views.py                  /api/hello/, /api/parse/
+  views.py                  /api/hello/ (страница + кнопка Parse), /api/parse/
   admin.py                  админка для Product
+  templates/api/hello.html  UI: кнопка Parse + вывод JSON
   services/
     hi_scraper.py           загрузка HTML (обход Cloudflare)
     hi_parser.py            разбор HTML в словарь

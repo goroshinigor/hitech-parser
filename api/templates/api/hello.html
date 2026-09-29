@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>hitech-parser — парсинг товара brain.com.ua</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      margin: 0 auto;
+      max-width: 960px;
+      padding: 24px 16px 48px;
+      line-height: 1.5;
+    }
+    h1 { font-size: 22px; margin: 0 0 8px; }
+    p.hint { margin: 0 0 20px; opacity: .75; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+    #url {
+      flex: 1 1 420px;
+      padding: 10px 12px;
+      font-size: 14px;
+      border: 1px solid #9aa0a6;
+      border-radius: 6px;
+      background: transparent;
+      color: inherit;
+    }
+    #parse-btn {
+      padding: 10px 22px;
+      font-size: 15px;
+      font-weight: 600;
+      border: 0;
+      border-radius: 6px;
+      background: #1a73e8;
+      color: #fff;
+      cursor: pointer;
+    }
+    #parse-btn:disabled { background: #9aa0a6; cursor: progress; }
+    #status { min-height: 22px; margin: 0 0 12px; font-size: 14px; }
+    #status.loading { color: #1a73e8; }
+    #status.ok { color: #188038; }
+    #status.error { color: #d93025; }
+    #output {
+      margin: 0;
+      padding: 16px;
+      min-height: 180px;
+      max-height: 65vh;
+      overflow: auto;
+      border: 1px solid #dadce0;
+      border-radius: 8px;
+      background: rgba(127, 127, 127, .08);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+  </style>
+</head>
+<body>
+  <h1>Парсер карточек товара brain.com.ua</h1>
+  <p class="hint">
+    Кнопка <strong>Parse</strong> забирает данные товара (название, цвет, память,
+    цены, фото, код товара, отзывы, характеристики), сохраняет их в БД и выводит
+    JSON на экран. Загрузка страницы может занять до минуты — сайт под Cloudflare.
+  </p>
+
+  <div class="controls">
+    <input id="url" type="url" value="{{ default_url }}" spellcheck="false"
+           placeholder="URL карточки товара">
+    <button id="parse-btn" type="button">Parse</button>
+  </div>
+
+  <p id="status"></p>
+  <pre id="output">// Здесь появится JSON с данными о товаре</pre>
+
+  <script>
+    const urlInput = document.getElementById("url");
+    const parseButton = document.getElementById("parse-btn");
+    const statusElement = document.getElementById("status");
+    const outputElement = document.getElementById("output");
+
+    function setStatus(text, kind) {
+      statusElement.textContent = text;
+      statusElement.className = kind || "";
+    }
+
+    async function runParse() {
+      const url = urlInput.value.trim();
+      if (!url) {
+        setStatus("Укажите URL карточки товара", "error");
+        return;
+      }
+
+      parseButton.disabled = true;
+      outputElement.textContent = "";
+      setStatus("Парсим " + url + " — это может занять до минуты…", "loading");
+
+      try {
+        const response = await fetch("/api/parse/?url=" + encodeURIComponent(url), {
+          headers: { "Accept": "application/json" },
+        });
+        const raw = await response.text();
+
+        let data;
+        try {
+          data = JSON.parse(raw);
+        } catch (error) {
+          throw new Error("Сервер вернул не JSON: " + raw.slice(0, 300));
+        }
+
+        if (!response.ok) {
+          setStatus("Ошибка парсинга: " + (data.error || response.status), "error");
+          outputElement.textContent = JSON.stringify(data, null, 2);
+          return;
+        }
+
+        setStatus("Готово: товар сохранён в БД, id = " + data.id, "ok");
+        outputElement.textContent = JSON.stringify(data.product, null, 2);
+      } catch (error) {
+        setStatus("Ошибка запроса: " + error.message, "error");
+      } finally {
+        parseButton.disabled = false;
+      }
+    }
+
+    parseButton.addEventListener("click", runParse);
+    urlInput.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") {
+        runParse();
+      }
+    });
+  </script>
+</body>
+</html>

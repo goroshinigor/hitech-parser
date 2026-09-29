@@ -7,14 +7,20 @@ from .services.hi_parser import DEFAULT_URL, parse_url
 
 
 # Create your views here.
+@require_GET
 def hello(request):
-    return JsonResponse({"message": "hello"})
+    """GET /api/hello/ — страница с кнопкой Parse.
+
+    Кнопка через JS дёргает `/api/parse/`, забирает данные о товаре
+    и выводит ответ сервера как JSON на экран.
+    """
+    return render(request, "api/hello.html", {"default_url": DEFAULT_URL})
 
 
 @require_GET
 def parse_view(request):
     """GET /api/parse/?url=... — парсит товар и сохраняет его в БД."""
-    url = request.GET.get("url", DEFAULT_URL)
+    url = request.GET.get("url") or DEFAULT_URL
     try:
         data = parse_url(url)
     except Exception as exc:  # noqa: BLE001
