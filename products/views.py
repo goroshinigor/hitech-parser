@@ -1,8 +1,9 @@
-from django.http import JsonResponse
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import render
 from django.views.decorators.http import require_GET
 
 from .models import Product
+from .services.csv_export import products_as_csv
 from .services.hi_parser import DEFAULT_URL, parse_url
 
 
@@ -34,3 +35,14 @@ def parse_product(request):
         },
         json_dumps_params={"ensure_ascii": False, "indent": 2},
     )
+
+
+@require_GET
+def export_csv(request):
+    """GET /products/export/csv/ — выгружает все товары из БД в CSV (Шаг-7)."""
+    response = HttpResponse(
+        products_as_csv(Product.objects.all()),
+        content_type="text/csv; charset=utf-8",
+    )
+    response["Content-Disposition"] = 'attachment; filename="products.csv"'
+    return response

@@ -1,21 +1,62 @@
 """Тесты приложения products.
 
 Страница с кнопкой Parse, эндпоинт парсинга, загрузка HTML (``requests`` с
-резервом ``curl_cffi``) и разбор HTML через ``bs4``. Сеть не используется:
-HTTP-клиенты и ``parse_url`` подменяются моками, HTML берётся из фикстуры.
+резервом ``curl_cffi``), разбор HTML через ``bs4``, браузерные парсеры
+(Selenium и Playwright), команда ``parse_search`` и выгрузка в CSV.
+Сеть и браузер не используются: HTTP-клиенты, драйвер и страница браузера
+подменяются моками, HTML берётся из фикстуры.
 """
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import csv
+import io
+import json
+import os
+import tempfile
+from unittest.mock import MagicMock, patch
 
 import requests
+from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 
 from .models import Product
+from .services.csv_export import CSV_FIELDS, products_as_csv
 from .services.hi_parser import DEFAULT_URL, parse_product
 from .services.hi_scraper import ScraperError, fetch_html
+from .services.playwright_parser import PlaywrightSearchParser
+from .services.search_flow import (
+    DEFAULT_QUERY,
+    HOME_URL,
+    PRODUCT_TITLE,
+    RESULT_ITEMS,
+    RESULT_TITLE_LINK,
+    SEARCH_INPUT,
+    BrowserFlowError,
+    looks_like_challenge,
+    search_url,
+    validate_product,
+)
+from .services.selenium_parser import SeleniumSearchParser
+
+try:  # selenium нужен только этим тестам и стоит в requirements.txt
+    from selenium.common.exceptions import (
+        NoSuchElementException,
+        WebDriverException,
+    )
+    from selenium.webdriver.common.keys import Keys
+except ImportError:  # pragma: no cover - окружение без selenium
+    NoSuchElementException = RuntimeError
+    WebDriverException = RuntimeError
+    Keys = None
+
+#: Ссылка на карточку, которую отдают результаты поиска.
+RESULT_URL = (
+    "https://brain.com.ua/ukr/Mobilniy_telefon_Apple_iPhone_15_128GB_Black-p1044347.html"
+)
+
 
 PARSED_PRODUCT = {
     "url": "https://brain.com.ua/ukr/example-product-p1.html",
@@ -127,6 +168,11 @@ class IndexViewTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, 'id="parse-btn"')
         self.assertContains(response, "/products/parse/")
+
+    def test_page_has_csv_export_link(self):
+        response = self.client.get(reverse("index"))
+
+        self.assertContains(response, reverse("export_csv"))
 
     def test_url_input_is_prefilled_with_default_url(self):
         response = self.client.get(reverse("index"))
@@ -316,4 +362,603 @@ class ParserFunctionTests(SimpleTestCase):
         self.assertEqual(data["photos"], [])
         self.assertEqual(data["reviews_count"], 0)
         self.assertEqual(data["characteristics"], {})
+
+
+class SearchFlowTests(SimpleTestCase):
+    """Общие шаги поиска: проверка челленджа и валидация данных товара."""
+
+    def test_challenge_page_is_detected(self):
+        self.assertTrue(looks_like_challenge(CHALLENGE_HTML))
+        self.assertFalse(looks_like_challenge(PRODUCT_HTML))
+
+    def test_valid_product_passes_through(self):
+        data = parse_product(PRODUCT_HTML, RESULT_URL)
+
+        self.assertIs(validate_product(data), data)
+
+    def test_product_without_name_is_rejected(self):
+        with self.assertRaises(BrowserFlowError):
+            validate_product({"name": "", "characteristics": {"Інше": {"Виробник": "Apple"}}})
+
+    def test_product_without_characteristics_is_rejected(self):
+        with self.assertRaises(BrowserFlowError):
+            validate_product({"name": "iPhone", "characteristics": {}})
+
+    def test_search_url_escapes_query(self):
+        self.assertEqual(
+            search_url("Apple iPhone 15 128GB Black"),
+            "https://brain.com.ua/ukr/search/?Search=Apple+iPhone+15+128GB+Black",
+        )
+        self.assertEqual(
+            search_url('телефон & "чохол"'),
+            "https://brain.com.ua/ukr/search/?Search=%D1%82%D0%B5%D0%BB%D0%B5%D1%84%D0%BE%D0%BD+%26+%22%D1%87%D0%BE%D1%85%D0%BE%D0%BB%22",
+        )
+
+
+class FakeDriverMixin:
+    """Собирает мок драйвера Selenium/страницы Playwright (без браузера)."""
+
+    @staticmethod
+    def selenium_driver(html: str = PRODUCT_HTML, url: str = RESULT_URL):
+        """Мок webdriver.Chrome: ищет те же селекторы, что и парсер.
+
+        Элементам выставлены ``is_displayed()/is_enabled() == True``: внутри
+        ``element_to_be_clickable`` Selenium сравнивает результат
+        ``is_displayed()`` с ``True`` (у «сырого» мока это сравнение ложно,
+        и ожидание просто висело бы до таймаута).
+        """
+        driver = MagicMock(name="driver")
+        driver.page_source = html
+        driver.current_url = url
+
+        def element(name):
+            mock = MagicMock(name=name)
+            mock.is_displayed.return_value = True
+            mock.is_enabled.return_value = True
+            return mock
+
+        search_input = element("search_input")
+        submit = element("submit")
+        search_input.find_elements.return_value = [submit]
+
+        result_item = element("result_item")
+        result_link = element("result_link")
+        result_link.get_attribute.return_value = url
+
+        elements = {
+            SEARCH_INPUT: search_input,
+            RESULT_ITEMS: result_item,
+            PRODUCT_TITLE: element("product_title"),
+        }
+        driver.find_element.side_effect = lambda by, selector: elements[selector]
+        driver.find_elements.side_effect = lambda by, selector: {
+            SEARCH_INPUT: [search_input],
+            f"{RESULT_ITEMS} {RESULT_TITLE_LINK}": [result_link],
+        }[selector]
+        return driver, {
+            "search_input": search_input,
+            "submit": submit,
+            "result_link": result_link,
+        }
+
+    @staticmethod
+    def playwright_page(html: str = PRODUCT_HTML, url: str = RESULT_URL):
+        """Мок page Playwright с теми же локаторами, что и парсер."""
+        page = MagicMock(name="page")
+        page.url = url
+        page.content.return_value = html
+
+        field = MagicMock(name="search_field")
+        field.is_visible.return_value = True
+        fields = MagicMock(name="fields")
+        fields.count.return_value = 1
+        fields.nth.return_value = field
+
+        submit = MagicMock(name="submit")
+        submit.count.return_value = 1
+        submit.first = submit
+        form = MagicMock(name="form")
+        form.locator.return_value = submit
+        field.locator.return_value = form
+
+        result_item = MagicMock(name="result_item")
+        result_item.first = result_item
+        items = MagicMock(name="items")
+        items.first = result_item
+
+        result_link = MagicMock(name="result_link")
+        result_link.first = result_link
+        result_link.get_attribute.return_value = url
+
+        product_title = MagicMock(name="product_title")
+        product_title.first = product_title
+
+        locators = {
+            SEARCH_INPUT: fields,
+            RESULT_ITEMS: items,
+            f"{RESULT_ITEMS} {RESULT_TITLE_LINK}": result_link,
+            PRODUCT_TITLE: product_title,
+        }
+        page.locator.side_effect = lambda selector: locators[selector]
+        return page, {
+            "search_input": field,
+            "submit": submit,
+            "result_link": result_link,
+            "items": items,
+        }
+
+
+
+class SeleniumFlowTests(FakeDriverMixin, SimpleTestCase):
+    """Шаги 1-6 на Selenium: драйвер подменён моком, браузер не запускается."""
+
+    def test_full_flow_searches_and_parses_product(self):
+        driver, elements = self.selenium_driver()
+        parser = SeleniumSearchParser(driver=driver)
+
+        data = parser.collect()
+
+        # Шаг-1: главная страница сайта.
+        driver.get.assert_called_once_with(HOME_URL)
+        # Шаг-2: запрос введён в поисковую строку.
+        elements["search_input"].clear.assert_called_once()
+        elements["search_input"].send_keys.assert_called_once_with(DEFAULT_QUERY)
+        # Шаг-3: нажата кнопка «Найти» внутри формы поиска.
+        elements["submit"].click.assert_called_once()
+        # Шаг-4: клик по первому результату и переход на карточку.
+        driver.execute_script.assert_called_once()
+        self.assertEqual(
+            driver.execute_script.call_args.args,
+            ("arguments[0].click()", elements["result_link"]),
+        )
+        self.assertEqual(elements["result_link"].get_attribute.call_args.args, ("href",))
+        # Cookie сброшены перед второй и третьей навигацией: иначе Cloudflare
+        # отдаёт челлендж вместо страницы.
+        self.assertEqual(driver.delete_all_cookies.call_count, 2)
+        # Шаг-5: данные собраны тем же bs4-парсером, что и в requests-версии.
+        self.assertEqual(data, parse_product(PRODUCT_HTML, RESULT_URL))
+        self.assertEqual(data["product_code"], "U0961530")
+
+    def test_steps_run_in_required_order(self):
+        driver, _ = self.selenium_driver()
+        parser = SeleniumSearchParser(driver=driver)
+        steps = []
+
+        with (
+            patch.object(
+                SeleniumSearchParser, "open_home", lambda self: steps.append("home")
+            ),
+            patch.object(
+                SeleniumSearchParser,
+                "search",
+                lambda self, query=None: steps.append("find"),
+            ),
+            patch.object(
+                SeleniumSearchParser,
+                "open_first_result",
+                lambda self, wait=None: steps.append("first") or RESULT_URL,
+            ),
+        ):
+            parser.collect()
+
+        self.assertEqual(steps, ["home", "find", "first"])
+
+    def test_custom_query_is_typed_instead_of_default(self):
+        driver, elements = self.selenium_driver()
+        parser = SeleniumSearchParser(query="Samsung Galaxy S24", driver=driver)
+
+        parser.search()
+
+        elements["search_input"].send_keys.assert_called_once_with("Samsung Galaxy S24")
+
+    def test_submit_button_failure_falls_back_to_enter(self):
+        driver, elements = self.selenium_driver()
+        elements["submit"].click.side_effect = WebDriverException("not interactable")
+        parser = SeleniumSearchParser(driver=driver)
+
+        parser.search()
+
+        elements["search_input"].send_keys.assert_any_call(Keys.ENTER)
+
+    def test_missing_results_raise_flow_error(self):
+        driver, _ = self.selenium_driver()
+        driver.find_element.side_effect = NoSuchElementException("нет результатов")
+        parser = SeleniumSearchParser(driver=driver, timeout=0)
+
+        with self.assertRaises(BrowserFlowError) as ctx:
+            parser.open_first_result()
+
+        self.assertIn("результаты поиска", str(ctx.exception))
+
+    def test_missing_results_fall_back_to_search_url(self):
+        driver, _ = self.selenium_driver()
+        parser = SeleniumSearchParser(driver=driver)
+        opened = []
+
+        def open_first_result(self, wait=None):
+            opened.append(1)
+            if len(opened) == 1:
+                raise BrowserFlowError("результаты поиска не появились")
+            return RESULT_URL
+
+        with patch.object(SeleniumSearchParser, "open_first_result", open_first_result):
+            data = parser.collect()
+
+        self.assertEqual(len(opened), 2)
+        self.assertEqual(driver.get.call_args.args, (search_url(DEFAULT_QUERY),))
+        self.assertEqual(data, parse_product(PRODUCT_HTML, RESULT_URL))
+
+    def test_card_click_failure_falls_back_to_direct_url(self):
+        driver, elements = self.selenium_driver()
+        driver.execute_script.side_effect = WebDriverException("element not visible")
+        parser = SeleniumSearchParser(driver=driver)
+
+        url = parser.open_first_result()
+
+        self.assertEqual(url, RESULT_URL)
+        self.assertEqual(driver.get.call_args.args, (RESULT_URL,))
+
+    def test_run_prints_product_and_keeps_foreign_driver_open(self):
+        driver, _ = self.selenium_driver()
+        parser = SeleniumSearchParser(driver=driver)
+
+        with patch("products.services.selenium_parser.print_product") as print_mock:
+            data = parser.run()
+
+        print_mock.assert_called_once_with(data)
+        driver.quit.assert_not_called()
+
+    def test_cloudflare_challenge_instead_of_home_page(self):
+        driver, _ = self.selenium_driver(html=CHALLENGE_HTML)
+        driver.find_element.side_effect = NoSuchElementException("нет формы поиска")
+        parser = SeleniumSearchParser(driver=driver, timeout=0)
+
+        with self.assertRaises(BrowserFlowError) as ctx:
+            parser.open_home()
+
+        self.assertIn("Cloudflare", str(ctx.exception))
+        driver.get.assert_called_once_with(HOME_URL)
+
+    def test_hidden_search_fields_raise_flow_error(self):
+        driver, _ = self.selenium_driver()
+        hidden = MagicMock(name="hidden_field")
+        hidden.is_displayed.return_value = False
+        driver.find_elements.side_effect = lambda by, selector: [hidden]
+        parser = SeleniumSearchParser(driver=driver)
+
+        with self.assertRaises(BrowserFlowError) as ctx:
+            parser.search()
+
+        self.assertIn("поле поиска", str(ctx.exception))
+
+    def test_empty_results_raise_flow_error(self):
+        driver, _ = self.selenium_driver()
+        driver.find_elements.side_effect = lambda by, selector: []
+        parser = SeleniumSearchParser(driver=driver)
+
+        with self.assertRaises(BrowserFlowError) as ctx:
+            parser.open_first_result()
+
+        self.assertIn("результатах поиска", str(ctx.exception))
+
+
+
+
+class PlaywrightFlowTests(FakeDriverMixin, SimpleTestCase):
+    """Шаги 1-6 на Playwright: страница подменена моком, браузер не стартует."""
+
+    def test_full_flow_searches_and_parses_product(self):
+        page, locators = self.playwright_page()
+        parser = PlaywrightSearchParser(page=page)
+
+        data = parser.collect()
+
+        # Шаг-1: главная страница сайта.
+        page.goto.assert_called_once_with(
+            HOME_URL, wait_until="domcontentloaded", timeout=60000
+        )
+        page.wait_for_selector.assert_called_once_with(
+            SEARCH_INPUT, state="attached", timeout=60000
+        )
+        # Шаг-2: запрос введён в поисковую строку.
+        locators["search_input"].click.assert_called_once()
+        locators["search_input"].fill.assert_called_once_with(DEFAULT_QUERY)
+        # Шаг-3: нажата кнопка «Найти».
+        locators["submit"].click.assert_called_once()
+        # Шаг-4: клик по первому результату и переход на карточку.
+        self.assertEqual(locators["result_link"].click.call_args.args, ())
+        self.assertEqual(
+            locators["result_link"].click.call_args.kwargs, {"force": True}
+        )
+        self.assertEqual(locators["result_link"].get_attribute.call_args.args, ("href",))
+        # Cookie сброшены перед второй и третьей навигацией: иначе Cloudflare
+        # отдаёт челлендж вместо страницы.
+        self.assertEqual(page.context.clear_cookies.call_count, 2)
+        # Шаг-5: данные собраны тем же bs4-парсером, что и в requests-версии.
+        self.assertEqual(data, parse_product(PRODUCT_HTML, RESULT_URL))
+        self.assertEqual(data["name"], PARSED_PRODUCT["name"])
+
+    def test_steps_run_in_required_order(self):
+        page, _ = self.playwright_page()
+        parser = PlaywrightSearchParser(page=page)
+        steps = []
+
+        with (
+            patch.object(
+                PlaywrightSearchParser, "open_home", lambda self: steps.append("home")
+            ),
+            patch.object(
+                PlaywrightSearchParser,
+                "search",
+                lambda self, query=None: steps.append("find"),
+            ),
+            patch.object(
+                PlaywrightSearchParser,
+                "open_first_result",
+                lambda self, wait=None: steps.append("first") or RESULT_URL,
+            ),
+        ):
+            parser.collect()
+
+        self.assertEqual(steps, ["home", "find", "first"])
+
+    def test_run_prints_product_and_keeps_foreign_page_open(self):
+        page, _ = self.playwright_page()
+        parser = PlaywrightSearchParser(page=page)
+
+        with patch("products.services.playwright_parser.print_product") as print_mock:
+            data = parser.run()
+
+        print_mock.assert_called_once_with(data)
+        page.close.assert_not_called()
+
+    def test_cloudflare_challenge_instead_of_home_page(self):
+        page, _ = self.playwright_page(html=CHALLENGE_HTML)
+        page.wait_for_selector.side_effect = RuntimeError("Timeout 60000ms exceeded")
+        parser = PlaywrightSearchParser(page=page)
+
+        with self.assertRaises(BrowserFlowError) as ctx:
+            parser.open_home()
+
+        self.assertIn("Cloudflare", str(ctx.exception))
+        page.goto.assert_called_once()
+
+    def test_hidden_search_fields_raise_flow_error(self):
+        page, locators = self.playwright_page()
+        locators["search_input"].is_visible.return_value = False
+        parser = PlaywrightSearchParser(page=page)
+
+        with self.assertRaises(BrowserFlowError) as ctx:
+            parser.search()
+
+        self.assertIn("поле поиска", str(ctx.exception))
+
+    def test_submit_failure_falls_back_to_enter(self):
+        page, locators = self.playwright_page()
+        locators["submit"].click.side_effect = RuntimeError("element is not visible")
+        parser = PlaywrightSearchParser(page=page)
+
+        parser.search()
+
+        locators["search_input"].press.assert_called_once_with("Enter")
+
+    def test_missing_results_raise_flow_error(self):
+        page, locators = self.playwright_page()
+        locators["items"].first.wait_for.side_effect = RuntimeError(
+            "Timeout 60000ms exceeded"
+        )
+        parser = PlaywrightSearchParser(page=page)
+
+        with self.assertRaises(BrowserFlowError) as ctx:
+            parser.open_first_result()
+
+        self.assertIn("результаты поиска", str(ctx.exception))
+
+    def test_missing_results_fall_back_to_search_url(self):
+        page, _ = self.playwright_page()
+        parser = PlaywrightSearchParser(page=page)
+        opened = []
+
+        def open_first_result(self, wait=None):
+            opened.append(1)
+            if len(opened) == 1:
+                raise BrowserFlowError("результаты поиска не появились")
+            return RESULT_URL
+
+        with patch.object(PlaywrightSearchParser, "open_first_result", open_first_result):
+            data = parser.collect()
+
+        self.assertEqual(len(opened), 2)
+        self.assertEqual(page.goto.call_args.args, (search_url(DEFAULT_QUERY),))
+        self.assertEqual(data, parse_product(PRODUCT_HTML, RESULT_URL))
+
+    def test_card_click_failure_falls_back_to_direct_url(self):
+        page, locators = self.playwright_page()
+        locators["result_link"].click.side_effect = RuntimeError("element is not visible")
+        parser = PlaywrightSearchParser(page=page)
+
+        url = parser.open_first_result()
+
+        self.assertEqual(url, RESULT_URL)
+        self.assertEqual(page.goto.call_args.args, (RESULT_URL,))
+
+class FakeSearchParser:
+    """Заглушка браузерного парсера для тестов команды ``parse_search``."""
+
+    instances: list = []
+
+    def __init__(self, **options):
+        self.options = options
+        self.closed = False
+        FakeSearchParser.instances.append(self)
+
+    def collect(self) -> dict:
+        return PARSED_PRODUCT
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class ParseSearchCommandTests(TestCase):
+    """Команда ``parse_search``: браузерный парсер -> печать -> сохранение в БД."""
+
+    def setUp(self):
+        FakeSearchParser.instances = []
+        patcher = patch.dict(
+            "products.management.commands.parse_search.ENGINES",
+            {"selenium": FakeSearchParser, "playwright": FakeSearchParser},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_prints_data_and_saves_product(self):
+        out = io.StringIO()
+
+        call_command("parse_search", stdout=out)
+
+        parser = FakeSearchParser.instances[0]
+        self.assertEqual(parser.options, {"query": DEFAULT_QUERY, "headless": True})
+        self.assertTrue(parser.closed)
+
+        printed = out.getvalue()
+        self.assertIn(PARSED_PRODUCT["name"], printed)
+        self.assertIn("Сохранено в БД", printed)
+        self.assertEqual(json.loads(printed[printed.index("{") : printed.rindex("}") + 1]), PARSED_PRODUCT)
+
+        product = Product.objects.get()
+        self.assertEqual(product.name, PARSED_PRODUCT["name"])
+        self.assertEqual(product.product_code, "U0961530")
+        self.assertEqual(product.photos, PARSED_PRODUCT["photos"])
+
+    def test_options_are_forwarded_to_engine(self):
+        out = io.StringIO()
+
+        call_command(
+            "parse_search",
+            "--query",
+            "Apple iPhone 15 128GB Black",
+            "--no-headless",
+            "--chrome-binary",
+            "/usr/bin/chromium",
+            stdout=out,
+        )
+
+        self.assertEqual(
+            FakeSearchParser.instances[0].options,
+            {
+                "query": "Apple iPhone 15 128GB Black",
+                "headless": False,
+                "browser_binary": "/usr/bin/chromium",
+            },
+        )
+
+    def test_no_save_flag_skips_database(self):
+        out = io.StringIO()
+
+        call_command("parse_search", "--no-save", stdout=out)
+
+        self.assertEqual(Product.objects.count(), 0)
+        self.assertIn("Сохранение в БД отключено", out.getvalue())
+
+    def test_engine_error_becomes_command_error(self):
+        class BrokenSearchParser(FakeSearchParser):
+            def collect(self) -> dict:
+                raise BrowserFlowError("Cloudflare показал челлендж")
+
+        with patch.dict(
+            "products.management.commands.parse_search.ENGINES",
+            {"selenium": BrokenSearchParser, "playwright": BrokenSearchParser},
+        ):
+            with self.assertRaises(CommandError) as ctx:
+                call_command("parse_search", stdout=io.StringIO())
+
+        self.assertIn("Cloudflare", str(ctx.exception))
+        self.assertEqual(Product.objects.count(), 0)
+        self.assertTrue(BrokenSearchParser.instances[0].closed)
+
+
+class CsvExportServiceTests(SimpleTestCase):
+    """Сервис выгрузки: CSV собирается из объектов Product."""
+
+    def test_env_without_products_returns_only_header(self):
+        reader = csv.reader(io.StringIO(products_as_csv([])))
+
+        self.assertEqual(next(reader), list(CSV_FIELDS))
+        with self.assertRaises(StopIteration):
+            next(reader)
+
+
+class ExportCsvTests(TestCase):
+    """Шаг-7: выгрузка товаров из БД в CSV (команда и HTTP-эндпоинт)."""
+
+    PHOTOS = (
+        "https://brain.com.ua/static/images/prod_img/second_1.jpg",
+        "https://brain.com.ua/static/images/prod_img/second_2.jpg",
+    )
+
+    def setUp(self):
+        Product.from_parsed(PARSED_PRODUCT)
+        Product.from_parsed(
+            {
+                **PARSED_PRODUCT,
+                "url": "https://brain.com.ua/ukr/second-p2.html",
+                "name": "Другий товар",
+                "photos": list(self.PHOTOS),
+            }
+        )
+
+    def _read_rows(self, text: str) -> list:
+        return list(csv.DictReader(io.StringIO(text)))
+
+    def test_command_writes_csv_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "products.csv")
+
+            call_command("export_csv", "--output", path, stdout=io.StringIO())
+
+            with open(path, encoding="utf-8-sig", newline="") as stream:
+                rows = list(csv.DictReader(stream))
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(list(rows[0]), list(CSV_FIELDS))
+
+        row = next(item for item in rows if item["url"].endswith("second-p2.html"))
+        self.assertEqual(row["name"], "Другий товар")
+        self.assertEqual(row["product_code"], "U0961530")
+        self.assertEqual(row["regular_price"], "65799.00")
+        self.assertEqual(row["photos_count"], "2")
+        self.assertEqual(row["photos"], ", ".join(self.PHOTOS))
+        self.assertEqual(
+            json.loads(row["characteristics"]), PARSED_PRODUCT["characteristics"]
+        )
+
+    def test_command_stdout_mode(self):
+        out = io.StringIO()
+
+        call_command("export_csv", "--to-stdout", stdout=out, stderr=io.StringIO())
+
+        rows = self._read_rows(out.getvalue())
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(sorted(rows[0]), sorted(CSV_FIELDS))
+
+    def test_http_endpoint_returns_csv_attachment(self):
+        response = self.client.get(reverse("export_csv"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text/csv", response["Content-Type"])
+        self.assertIn("attachment", response["Content-Disposition"])
+
+        rows = self._read_rows(response.content.decode("utf-8"))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(list(rows[0]), list(CSV_FIELDS))
+
+    def test_endpoint_with_empty_database_returns_header_only(self):
+        Product.objects.all().delete()
+
+        response = self.client.get(reverse("export_csv"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self._read_rows(response.content.decode("utf-8")), [])
+
 

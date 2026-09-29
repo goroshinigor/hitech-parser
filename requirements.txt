@@ -4,3 +4,5 @@ requests
 beautifulsoup4
 lxml
 curl_cffi
+selenium
+playwright
