@@ -26,8 +26,13 @@ Django + PostgreSQL парсер карточек товаров с [brain.com.u
 | Разрешение дисплея | характеристика «Роздільна здатність екрану» |
 | Все характеристики (словарь) | `.br-pr-chr-wrap` → `группа -> {характеристика: значение}` |
 
-> Сайт защищён Cloudflare, поэтому для загрузки HTML используется `curl_cffi`
-> с имперсонацией браузера Chrome (обычный `requests` получает заглушку).
+> **Чем парсим.** Разбор HTML — `bs4` (`BeautifulSoup` с парсером `lxml`),
+> загрузка — `requests`. Но сайт закрыт Cloudflare managed challenge: обычный
+> `requests` (в том числе с браузерным `User-Agent` и с `Session`) получает
+> **403** и страницу «Just a moment…». Поэтому загрузка устроена в два шага:
+> сначала одна попытка через `requests`, а если пришёл челлендж — повтор через
+> `curl_cffi` с имперсонацией Chrome (у него API как у `requests`). Обе ветки
+> покрыты тестами, см. `products/tests.py`.
 
 ## Запуск
 
@@ -118,7 +123,7 @@ products/
   templates/products/index.html  UI: кнопка Parse + вывод JSON
   tests.py                  тесты страницы и эндпоинта (без сети)
   services/
-    hi_scraper.py           загрузка HTML (обход Cloudflare)
+    hi_scraper.py           загрузка HTML (requests, резерв — curl_cffi)
     hi_parser.py            разбор HTML в словарь
   management/commands/
     parse_product.py        CLI: парсинг + сохранение

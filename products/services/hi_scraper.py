@@ -1,9 +1,14 @@
-"""Скрейпер страниц brain.com.ua.
+"""Загрузка HTML страниц brain.com.ua.
 
-Сайт защищён Cloudflare (managed challenge), поэтому обычный ``requests``
-получает заглушку "Just a moment...". Вместо него используется ``curl_cffi``
-с имперсонацией браузера Chrome — это проходит проверку TLS-отпечатка и
-позволяет получить реальный HTML.
+Основной HTTP-клиент — ``requests`` (:func:`_fetch_with_requests`), разбор
+HTML делает ``bs4`` (см. :mod:`products.services.hi_parser`).
+
+Особенность сайта: он закрыт Cloudflare managed challenge — на запрос без
+браузерного TLS-отпечатка приходит 403 и заглушка "Just a moment..." (проверено
+для ``requests`` с обычными заголовками, с браузерным User-Agent и с
+``Session``). Поэтому, если ``requests`` получил челлендж, страница
+перезагружается через ``curl_cffi`` с имперсонацией Chrome — у него API как у
+``requests``. Если не помогло и это, поднимается :class:`ScraperError`.
 """
 
 from __future__ import annotations
@@ -11,14 +16,18 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from curl_cffi import requests as curl_requests
+import requests
 
 DEFAULT_TIMEOUT = 30
-DEFAULT_IMPERSONATE = "chrome"
 DEFAULT_RETRIES = 3
 RETRY_DELAY = 2.0
+IMPERSONATE = "chrome"
 
 BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,"
         "image/avif,image/webp,*/*;q=0.8"
@@ -28,8 +37,52 @@ BROWSER_HEADERS = {
 }
 
 
+# Признаки страницы-челленджа Cloudflare вместо карточки товара.
+CHALLENGE_MARKERS = ("Just a moment", "cf_chl_opt", "Attention Required")
+
+
 class ScraperError(RuntimeError):
     """Не удалось получить HTML страницы."""
+
+
+def _is_challenge(html: str) -> bool:
+    """Похож ли ответ на заглушку Cloudflare, а не на страницу товара."""
+    return any(marker in html for marker in CHALLENGE_MARKERS)
+
+
+def _fetch_with_requests(url: str, timeout: int) -> str:
+    """Основной путь загрузки — обычный ``requests``."""
+    response = requests.get(url, headers=BROWSER_HEADERS, timeout=timeout)
+    response.raise_for_status()
+
+    html = response.text
+    if _is_challenge(html):
+        raise ScraperError("Cloudflare challenge не пройден (requests)")
+
+    return html
+
+
+def _fetch_with_curl_cffi(url: str, timeout: int) -> str:
+    """Резервный путь — ``curl_cffi`` с имперсонацией браузера Chrome.
+
+    Импорт ленивый: ``curl_cffi`` нужен только для обхода Cloudflare,
+    без него модуль продолжает работать на ``requests``.
+    """
+    from curl_cffi import requests as curl_requests
+
+    response = curl_requests.get(
+        url,
+        impersonate=IMPERSONATE,
+        headers=BROWSER_HEADERS,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+
+    html = response.text
+    if _is_challenge(html):
+        raise ScraperError("Cloudflare challenge не пройден (curl_cffi)")
+
+    return html
 
 
 def fetch_html(
@@ -39,33 +92,27 @@ def fetch_html(
 ) -> str:
     """Загружает HTML страницы и возвращает его как строку.
 
-    Делает несколько попыток с паузой, чтобы пережить периодические
-    срабатывания Cloudflare.
+    Сначала одна попытка через ``requests``. Если он не смог (Cloudflare не
+    пропустил запрос или сеть отвалилась), идут попытки через ``curl_cffi``
+    с паузой между ними.
     """
-    last_error: Optional[Exception] = None
+    try:
+        return _fetch_with_requests(url, timeout)
+    except Exception as requests_error:  # noqa: BLE001 - нужен фолбэк
+        last_error: Optional[Exception] = None
 
-    for attempt in range(1, retries + 1):
-        try:
-            response = curl_requests.get(
-                url,
-                impersonate=DEFAULT_IMPERSONATE,
-                headers=BROWSER_HEADERS,
-                timeout=timeout,
-            )
-            response.raise_for_status()
+        for attempt in range(1, retries + 1):
+            try:
+                return _fetch_with_curl_cffi(url, timeout)
+            except Exception as exc:  # noqa: BLE001 - нужен общий ретрай
+                last_error = exc
+                if attempt < retries:
+                    time.sleep(RETRY_DELAY * attempt)
 
-            html = response.text
-            # Признак не пройденной проверки Cloudflare.
-            if "Just a moment" in html or "cf_chl_opt" in html:
-                raise ScraperError("Cloudflare challenge не пройден")
-
-            return html
-        except Exception as exc:  # noqa: BLE001 - нужен общий ретрай
-            last_error = exc
-            if attempt < retries:
-                time.sleep(RETRY_DELAY * attempt)
-
-    raise ScraperError(f"Не удалось загрузить {url}: {last_error}")
+        raise ScraperError(
+            f"Не удалось загрузить {url}: requests -> {requests_error}; "
+            f"curl_cffi -> {last_error}"
+        ) from last_error
 
 
 if __name__ == "__main__":
