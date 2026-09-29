@@ -96,7 +96,7 @@
       setStatus("Парсим " + url + " — это может занять до минуты…", "loading");
 
       try {
-        const response = await fetch("/api/parse/?url=" + encodeURIComponent(url), {
+        const response = await fetch("/products/parse/?url=" + encodeURIComponent(url), {
           headers: { "Accept": "application/json" },
         });
         const raw = await response.text();

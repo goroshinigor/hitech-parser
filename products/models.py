@@ -1,4 +1,4 @@
-"""Модели приложения api."""
+"""Модели приложения products."""
 
 from __future__ import annotations
 

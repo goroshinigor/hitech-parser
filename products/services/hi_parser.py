@@ -16,7 +16,7 @@
 
 Модуль не зависит от Django и может использоваться как обычный скрипт:
 
-    python -m api.services.hi_parser [URL]
+    python -m products.services.hi_parser [URL]
 
 По умолчанию парсится страница из задания (iPhone 16 Pro Max).
 """

@@ -12,8 +12,8 @@ import json
 
 from django.core.management.base import BaseCommand, CommandError
 
-from api.models import Product
-from api.services.hi_parser import DEFAULT_URL, parse_url
+from products.models import Product
+from products.services.hi_parser import DEFAULT_URL, parse_url
 
 
 class Command(BaseCommand):

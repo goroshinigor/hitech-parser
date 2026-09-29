@@ -65,8 +65,8 @@ USE_SQLITE=1 python manage.py parse_product
 Парсинг из кода / как скрипт (Шаг-2 и Шаг-3):
 
 ```bash
-python -m api.services.hi_parser
-python -m api.services.hi_parser "<URL товара>"
+python -m products.services.hi_parser
+python -m products.services.hi_parser "<URL товара>"
 ```
 
 Management-команда (парсинг + печать + сохранение в БД):
@@ -79,7 +79,7 @@ python manage.py parse_product "<URL товара>"
 HTTP-эндпоинт:
 
 ```
-GET /api/parse/?url=<URL товара>
+GET /products/parse/?url=<URL товара>
 ```
 
 Возвращает JSON `{"saved": true, "id": ..., "product": {...}}` и сохраняет
@@ -88,22 +88,35 @@ GET /api/parse/?url=<URL товара>
 Веб-страница с кнопкой:
 
 ```
-GET /api/hello/
+GET /products/
 ```
 
 Страница с предзаполненным URL товара и кнопкой **Parse**: по клику JS
-обращается к `/api/parse/`, сохраняет товар и выводит полученный JSON
+обращается к `/products/parse/`, сохраняет товар и выводит полученный JSON
 в блок на странице (ошибки парсинга показываются там же).
+
+## Тесты
+
+```bash
+USE_SQLITE=1 python manage.py test
+docker compose exec web python manage.py test
+```
+
+Проверяются страница `/products/` (кнопка Parse, предзаполненный URL товара)
+и `/products/parse/` (сохранение товара, повторный парс того же URL обновляет
+ту же запись, ошибка парсинга → 502). Сеть не используется: `parse_url`
+подменяется моком.
 
 ## Структура
 
 ```
 config/                     настройки Django
-api/
+products/
   models.py                 модель Product
-  views.py                  /api/hello/ (страница + кнопка Parse), /api/parse/
+  views.py                  /products/ (страница + кнопка Parse), /products/parse/
   admin.py                  админка для Product
-  templates/api/hello.html  UI: кнопка Parse + вывод JSON
+  templates/products/index.html  UI: кнопка Parse + вывод JSON
+  tests.py                  тесты страницы и эндпоинта (без сети)
   services/
     hi_scraper.py           загрузка HTML (обход Cloudflare)
     hi_parser.py            разбор HTML в словарь
